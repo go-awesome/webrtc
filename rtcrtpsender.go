@@ -1,8 +1,12 @@
 package webrtc
 
 import (
+	"fmt"
+	"sync"
+
 	"github.com/pions/rtcp"
 	"github.com/pions/rtp"
+	"github.com/pions/srtp"
 	"github.com/pions/webrtc/pkg/media"
 )
 
@@ -10,21 +14,27 @@ const rtpOutboundMTU = 1400
 
 // RTCRtpSender allows an application to control how a given RTCTrack is encoded and transmitted to a remote peer
 type RTCRtpSender struct {
+	lock sync.RWMutex
+
 	Track *RTCTrack
 
 	transport *RTCDtlsTransport
+
+	// A reference to the associated api object
+	api *API
 }
 
 // NewRTCRtpSender constructs a new RTCRtpSender
-func NewRTCRtpSender(track *RTCTrack, transport *RTCDtlsTransport) *RTCRtpSender {
+func (api *API) NewRTCRtpSender(track *RTCTrack, transport *RTCDtlsTransport) *RTCRtpSender {
 	return &RTCRtpSender{
 		Track:     track,
 		transport: transport,
+		api:       api,
 	}
 }
 
 // Send Attempts to set the parameters controlling the sending of media.
-func (r *RTCRtpSender) Send(parameters RTCRtpSendParameters) {
+func (r *RTCRtpSender) Send(parameters RTCRtpSendParameters) error {
 	sampleInput := make(chan media.RTCSample, 15) // Is the buffering needed?
 	rawInput := make(chan *rtp.Packet, 15)        // Is the buffering needed?
 	rtcpInput := make(chan rtcp.Packet, 15)       // Is the buffering needed?
@@ -41,7 +51,25 @@ func (r *RTCRtpSender) Send(parameters RTCRtpSendParameters) {
 		go r.handleSampleRTP(sampleInput)
 	}
 
-	go r.handleRTCP(r.transport, rtcpInput)
+	dtls, err := r.Transport()
+	if err != nil {
+		return err
+	}
+
+	srtcpSession, err := dtls.getSrtcpSession()
+	if err != nil {
+		return err
+	}
+
+	ssrc := r.Track.Ssrc
+	srtcpStream, err := srtcpSession.OpenReadStream(ssrc)
+	if err != nil {
+		return fmt.Errorf("failed to open RTCP ReadStream, RTCTrack done for: %v %d", err, ssrc)
+	}
+
+	go r.handleRTCP(srtcpStream, rtcpInput)
+
+	return nil
 }
 
 // Stop irreversibly stops the RTCRtpSender
@@ -62,7 +90,10 @@ func (r *RTCRtpSender) handleRawRTP(rtpPackets chan *rtp.Packet) {
 			return
 		}
 
-		r.sendRTP(p)
+		err := r.sendRTP(p)
+		if err != nil {
+			pcLog.Warnf("failed to send RTP: %v", err)
+		}
 	}
 }
 
@@ -83,29 +114,33 @@ func (r *RTCRtpSender) handleSampleRTP(rtpPackets chan media.RTCSample) {
 		}
 		packets := packetizer.Packetize(in.Data, in.Samples)
 		for _, p := range packets {
-			r.sendRTP(p)
+			err := r.sendRTP(p)
+			if err != nil {
+				pcLog.Warnf("failed to send RTP: %v", err)
+			}
 		}
 	}
 
 }
 
-func (r *RTCRtpSender) handleRTCP(transport *RTCDtlsTransport, rtcpPackets chan rtcp.Packet) {
-	srtcpSession, err := transport.getSRTCPSession()
-	if err != nil {
-		pcLog.Warnf("Failed to open SRTCPSession, RTCTrack done for: %v %d \n", err, r.Track.Ssrc)
-		return
+// Transport returns the RTCDtlsTransport instance over which
+// RTP is sent and received.
+func (r *RTCRtpSender) Transport() (*RTCDtlsTransport, error) {
+	r.lock.RLock()
+	defer r.lock.RUnlock()
+
+	if r.transport == nil {
+		return nil, fmt.Errorf("the DTLS transport is not started")
 	}
 
-	readStream, err := srtcpSession.OpenReadStream(r.Track.Ssrc)
-	if err != nil {
-		pcLog.Warnf("Failed to open RTCP ReadStream, RTCTrack done for: %v %d \n", err, r.Track.Ssrc)
-		return
-	}
+	return r.transport, nil
+}
 
+func (r *RTCRtpSender) handleRTCP(stream *srtp.ReadStreamSRTCP, rtcpPackets chan rtcp.Packet) {
 	var rtcpPacket rtcp.Packet
 	for {
 		rtcpBuf := make([]byte, receiveMTU)
-		i, err := readStream.Read(rtcpBuf)
+		i, err := stream.Read(rtcpBuf)
 		if err != nil {
 			pcLog.Warnf("Failed to read, RTCTrack done for: %v %d \n", err, r.Track.Ssrc)
 			return
@@ -122,23 +157,27 @@ func (r *RTCRtpSender) handleRTCP(transport *RTCDtlsTransport, rtcpPackets chan 
 		default:
 		}
 	}
-
 }
 
-func (r *RTCRtpSender) sendRTP(packet *rtp.Packet) {
-	srtpSession, err := r.transport.getSRTPSession()
+func (r *RTCRtpSender) sendRTP(packet *rtp.Packet) error {
+	dtls, err := r.Transport()
 	if err != nil {
-		pcLog.Warnf("SendRTP failed to open SrtpSession: %v", err)
-		return
+		return err
+	}
+
+	srtpSession, err := dtls.getSrtpSession()
+	if err != nil {
+		return err
 	}
 
 	writeStream, err := srtpSession.OpenWriteStream()
 	if err != nil {
-		pcLog.Warnf("SendRTP failed to open WriteStream: %v", err)
-		return
+		return fmt.Errorf("failed to open WriteStream: %v", err)
 	}
 
 	if _, err := writeStream.WriteRTP(&packet.Header, packet.Payload); err != nil {
-		pcLog.Warnf("SendRTP failed to write: %v", err)
+		return fmt.Errorf("failed to write: %v", err)
 	}
+
+	return nil
 }

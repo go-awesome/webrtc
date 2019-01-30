@@ -12,14 +12,11 @@ import (
 	"time"
 
 	"github.com/pions/dtls"
+	"github.com/pions/rtcp"
+	"github.com/pions/rtp"
 	"github.com/pions/srtp"
 	"github.com/pions/webrtc/internal/mux"
 	"github.com/pions/webrtc/pkg/rtcerr"
-)
-
-const (
-	srtpMasterKeyLen     = 16
-	srtpMasterKeySaltLen = 14
 )
 
 // RTCDtlsTransport allows an application access to information about the DTLS
@@ -39,7 +36,6 @@ type RTCDtlsTransport struct {
 
 	conn *dtls.Conn
 
-	srtpHasKeyed  bool
 	srtpSession   *srtp.SessionSRTP
 	srtcpSession  *srtp.SessionSRTCP
 	srtpEndpoint  *mux.Endpoint
@@ -90,100 +86,124 @@ func (t *RTCDtlsTransport) GetLocalParameters() RTCDtlsParameters {
 	}
 }
 
+// Note: the caller should hold the datachannel lock.
 func (t *RTCDtlsTransport) startSRTP() error {
-	t.lock.Lock()
-	defer t.lock.Unlock()
-
-	if t.srtpSession == nil {
-		t.srtpSession = srtp.CreateSessionSRTP()
+	srtpConfig := &srtp.Config{
+		Profile: srtp.ProtectionProfileAes128CmHmacSha1_80,
 	}
-	if t.srtcpSession == nil {
-		t.srtcpSession = srtp.CreateSessionSRTCP()
-	}
-	if t.conn == nil || t.srtpHasKeyed {
-		return nil
-	}
-	t.srtpHasKeyed = true
-
-	keyingMaterial, err := t.conn.ExportKeyingMaterial([]byte("EXTRACTOR-dtls_srtp"), nil, (srtpMasterKeyLen*2)+(srtpMasterKeySaltLen*2))
+	err := srtpConfig.ExtractSessionKeysFromDTLS(t.conn, t.isClient())
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to extract sctp session keys: %v", err)
 	}
 
-	offset := 0
-	clientWriteKey := append([]byte{}, keyingMaterial[offset:offset+srtpMasterKeyLen]...)
-	offset += srtpMasterKeyLen
-
-	serverWriteKey := append([]byte{}, keyingMaterial[offset:offset+srtpMasterKeyLen]...)
-	offset += srtpMasterKeyLen
-
-	clientWriteKey = append(clientWriteKey, keyingMaterial[offset:offset+srtpMasterKeySaltLen]...)
-	offset += srtpMasterKeySaltLen
-
-	serverWriteKey = append(serverWriteKey, keyingMaterial[offset:offset+srtpMasterKeySaltLen]...)
-
-	if !t.isClient() {
-		err = t.srtpSession.Start(
-			serverWriteKey[0:16], serverWriteKey[16:],
-			clientWriteKey[0:16], clientWriteKey[16:],
-			srtp.ProtectionProfileAes128CmHmacSha1_80, t.srtpEndpoint,
-		)
-
-		if err == nil {
-			err = t.srtcpSession.Start(
-				serverWriteKey[0:16], serverWriteKey[16:],
-				clientWriteKey[0:16], clientWriteKey[16:],
-				srtp.ProtectionProfileAes128CmHmacSha1_80, t.srtcpEndpoint,
-			)
-		}
-	} else {
-		err = t.srtpSession.Start(
-			clientWriteKey[0:16], clientWriteKey[16:],
-			serverWriteKey[0:16], serverWriteKey[16:],
-			srtp.ProtectionProfileAes128CmHmacSha1_80, t.srtpEndpoint,
-		)
-
-		if err == nil {
-			err = t.srtcpSession.Start(
-				clientWriteKey[0:16], clientWriteKey[16:],
-				serverWriteKey[0:16], serverWriteKey[16:],
-				srtp.ProtectionProfileAes128CmHmacSha1_80, t.srtcpEndpoint,
-			)
-		}
+	srtpSession, err := srtp.NewSessionSRTP(t.srtpEndpoint, srtpConfig)
+	if err != nil {
+		return fmt.Errorf("failed to start srtp: %v", err)
 	}
 
-	return err
+	srtcpSession, err := srtp.NewSessionSRTCP(t.srtcpEndpoint, srtpConfig)
+	if err != nil {
+		return fmt.Errorf("failed to start srtcp: %v", err)
+	}
 
+	t.srtpSession = srtpSession
+	t.srtcpSession = srtcpSession
+
+	return nil
 }
 
-func (t *RTCDtlsTransport) getSRTPSession() (*srtp.SessionSRTP, error) {
+func (t *RTCDtlsTransport) getSrtpSession() (*srtp.SessionSRTP, error) {
 	t.lock.RLock()
-	if t.srtpSession != nil && t.srtpHasKeyed {
-		t.lock.RUnlock()
-		return t.srtpSession, nil
-	}
-	t.lock.RUnlock()
+	defer t.lock.RUnlock()
 
-	if err := t.startSRTP(); err != nil {
-		return nil, err
+	if t.srtpSession == nil {
+		return nil, errors.New("the SRTP session is not started")
 	}
 
 	return t.srtpSession, nil
 }
 
-func (t *RTCDtlsTransport) getSRTCPSession() (*srtp.SessionSRTCP, error) {
+func (t *RTCDtlsTransport) getSrtcpSession() (*srtp.SessionSRTCP, error) {
 	t.lock.RLock()
-	if t.srtcpSession != nil && t.srtpHasKeyed {
-		t.lock.RUnlock()
-		return t.srtcpSession, nil
-	}
-	t.lock.RUnlock()
+	defer t.lock.RUnlock()
 
-	if err := t.startSRTP(); err != nil {
-		return nil, err
+	if t.srtcpSession == nil {
+		return nil, errors.New("the SRTCP session is not started")
 	}
 
 	return t.srtcpSession, nil
+}
+
+// drainSRTP pulls and discards RTP/RTCP packets that don't match any SRTP
+// These could be sent to the user, but right now we don't provide an API
+// to distribute orphaned RTCP messages. This is needed to make sure we don't block
+// and provides useful debugging messages
+func (t *RTCDtlsTransport) drainSRTP() {
+	go t.drainRTPSessions()
+	go t.drainRTCPSessions()
+}
+
+func (t *RTCDtlsTransport) drainRTPSessions() {
+	srtpSession := t.srtpSession
+	for {
+		s, ssrc, err := srtpSession.AcceptStream()
+		if err != nil {
+			pcLog.Warnf("Failed to accept RTP %v \n", err)
+			return
+		}
+
+		go t.drainRTPStream(s, ssrc)
+	}
+}
+
+func (t *RTCDtlsTransport) drainRTPStream(stream *srtp.ReadStreamSRTP, ssrc uint32) {
+	rtpBuf := make([]byte, receiveMTU)
+	rtpPacket := &rtp.Packet{}
+
+	for {
+		i, err := stream.Read(rtpBuf)
+		if err != nil {
+			pcLog.Warnf("Failed to read, drainSRTP done for: %v %d \n", err, ssrc)
+			return
+		}
+
+		if err := rtpPacket.Unmarshal(rtpBuf[:i]); err != nil {
+			pcLog.Warnf("Failed to unmarshal RTP packet, discarding: %v \n", err)
+			continue
+		}
+		pcLog.Debugf("got RTP: %+v", rtpPacket)
+	}
+}
+
+func (t *RTCDtlsTransport) drainRTCPSessions() {
+	srtcpSession := t.srtcpSession
+	for {
+		s, ssrc, err := srtcpSession.AcceptStream()
+		if err != nil {
+			pcLog.Warnf("Failed to accept RTCP %v \n", err)
+			return
+		}
+
+		go t.drainRTCPStream(s, ssrc)
+	}
+}
+
+func (t *RTCDtlsTransport) drainRTCPStream(stream *srtp.ReadStreamSRTCP, ssrc uint32) {
+	rtcpBuf := make([]byte, receiveMTU)
+	for {
+		i, err := stream.Read(rtcpBuf)
+		if err != nil {
+			pcLog.Warnf("Failed to read, drainSRTCP done for: %v %d \n", err, ssrc)
+			return
+		}
+
+		rtcpPacket, _, err := rtcp.Unmarshal(rtcpBuf[:i])
+		if err != nil {
+			pcLog.Warnf("Failed to unmarshal RTCP packet, discarding: %v \n", err)
+			continue
+		}
+		pcLog.Debugf("got RTCP: %+v", rtcpPacket)
+	}
 }
 
 func (t *RTCDtlsTransport) isClient() bool {
@@ -248,6 +268,31 @@ func (t *RTCDtlsTransport) Start(remoteParameters RTCDtlsParameters) error {
 	}
 
 	return nil
+}
+
+// Stop stops and closes the RTCDtlsTransport object.
+func (t *RTCDtlsTransport) Stop() error {
+	t.lock.Lock()
+	defer t.lock.Unlock()
+
+	// Try closing everything and collect the errors
+	var closeErrs []error
+
+	if t.srtpSession != nil {
+		if err := t.srtpSession.Close(); err != nil {
+			closeErrs = append(closeErrs, err)
+		}
+	}
+
+	if t.srtcpSession != nil {
+		if err := t.srtcpSession.Close(); err != nil {
+			closeErrs = append(closeErrs, err)
+		}
+	}
+
+	// TODO: Close DTLS itself? Currently closed by ICE
+
+	return flattenErrs(closeErrs)
 }
 
 func (t *RTCDtlsTransport) validateFingerPrint(remoteParameters RTCDtlsParameters, remoteCert *x509.Certificate) error {

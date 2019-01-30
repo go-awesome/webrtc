@@ -3,7 +3,6 @@ package webrtc
 import (
 	"testing"
 
-	"github.com/pions/sdp"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -30,6 +29,6 @@ func TestCodecRegistration(t *testing.T) {
 		assert.Equal(t, f.e, err)
 
 	}
-	_, err := api.mediaEngine.getCodecSDP(sdp.Codec{PayloadType: invalidPT})
+	_, err := api.mediaEngine.getCodecSDP(RTCRtpCodecParameters{PayloadType: invalidPT})
 	assert.Equal(t, err, ErrCodecNotFound)
 }

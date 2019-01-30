@@ -1,11 +1,8 @@
 package webrtc
 
 import (
-	"strconv"
-
 	"github.com/pions/rtp"
 	"github.com/pions/rtp/codecs"
-	"github.com/pions/sdp"
 )
 
 // PayloadTypes for the default codecs
@@ -47,15 +44,22 @@ func (m *MediaEngine) getCodec(payloadType uint8) (*RTCRtpCodec, error) {
 	return nil, ErrCodecNotFound
 }
 
-func (m *MediaEngine) getCodecSDP(sdpCodec sdp.Codec) (*RTCRtpCodec, error) {
+func (m *MediaEngine) getCodecSDP(codecParams RTCRtpCodecParameters) (*RTCRtpCodec, error) {
 	for _, codec := range m.codecs {
-		if codec.Name == sdpCodec.Name &&
-			codec.ClockRate == sdpCodec.ClockRate &&
-			(sdpCodec.EncodingParameters == "" ||
-				strconv.Itoa(int(codec.Channels)) == sdpCodec.EncodingParameters) &&
-			codec.SdpFmtpLine == sdpCodec.Fmtp { // TODO: Protocol specific matching?
+		if codec.Name == codecParams.Name &&
+			codec.ClockRate == codecParams.ClockRate &&
+			codec.Channels == codecParams.Channels {
+			ok, err := codecParams.equalFMTP(codec.SdpFmtpLine) // TODO: Protocol specific matching?
+			if err != nil {
+				pcLog.Warnf("failed compare FMTP: %v", err)
+				continue
+			}
+			if !ok {
+				continue
+			}
 			return codec, nil
 		}
+
 	}
 	return nil, ErrCodecNotFound
 }
@@ -92,7 +96,7 @@ func NewRTCRtpG722Codec(payloadType uint8, clockrate uint32) *RTCRtpCodec {
 }
 
 // NewRTCRtpOpusCodec is a helper to create an Opus codec
-func NewRTCRtpOpusCodec(payloadType uint8, clockrate uint32, channels uint16) *RTCRtpCodec {
+func NewRTCRtpOpusCodec(payloadType uint8, clockrate uint32, channels uint32) *RTCRtpCodec {
 	c := NewRTCRtpCodec(RTCRtpCodecTypeAudio,
 		Opus,
 		clockrate,
@@ -176,7 +180,7 @@ func NewRTCRtpCodec(
 	codecType RTCRtpCodecType,
 	name string,
 	clockrate uint32,
-	channels uint16,
+	channels uint32,
 	fmtp string,
 	payloadType uint8,
 	payloader rtp.Payloader,
@@ -199,7 +203,7 @@ func NewRTCRtpCodec(
 type RTCRtpCodecCapability struct {
 	MimeType    string
 	ClockRate   uint32
-	Channels    uint16
+	Channels    uint32 // uint32 as specified in ORTC
 	SdpFmtpLine string
 }
 

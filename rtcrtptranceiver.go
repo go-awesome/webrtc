@@ -14,6 +14,9 @@ type RTCRtpTransceiver struct {
 	// firedDirection   RTCRtpTransceiverDirection
 	// receptive bool
 	stopped bool
+
+	remoteCapabilities     RTCRtpParameters
+	recvDecodingParameters []RTCRtpDecodingParameters
 }
 
 func (t *RTCRtpTransceiver) setSendingTrack(track *RTCTrack) error {

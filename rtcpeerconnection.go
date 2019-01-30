@@ -7,13 +7,11 @@ import (
 	"crypto/rand"
 	"fmt"
 	"net"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/pions/rtcp"
-	"github.com/pions/rtp"
 	"github.com/pions/sdp"
 	"github.com/pions/webrtc/pkg/ice"
 	"github.com/pions/webrtc/pkg/logging"
@@ -161,17 +159,6 @@ func (api *API) NewRTCPeerConnection(configuration RTCConfiguration) (*RTCPeerCo
 	if err != nil {
 		return nil, err
 	}
-
-	// Create the ice transport
-	iceTransport := pc.createICETransport()
-	pc.iceTransport = iceTransport
-
-	// Create the DTLS transport
-	dtlsTransport, err := pc.createDTLSTransport()
-	if err != nil {
-		return nil, err
-	}
-	pc.dtlsTransport = dtlsTransport
 
 	return pc, nil
 }
@@ -740,6 +727,10 @@ func (pc *RTCPeerConnection) SetRemoteDescription(desc RTCSessionDescription) er
 		weOffer = false
 	}
 
+	// Create the ice transport
+	iceTransport := pc.createICETransport()
+	pc.iceTransport = iceTransport
+
 	for _, m := range pc.RemoteDescription().parsed.MediaDescriptions {
 		for _, a := range m.Attributes {
 			if a.IsICECandidate() {
@@ -764,6 +755,13 @@ func (pc *RTCPeerConnection) SetRemoteDescription(desc RTCSessionDescription) er
 		}
 	}
 
+	// Create the DTLS transport
+	dtlsTransport, err := pc.createDTLSTransport()
+	if err != nil {
+		return err
+	}
+	pc.dtlsTransport = dtlsTransport
+
 	fingerprint, ok := desc.parsed.Attribute("fingerprint")
 	if !ok {
 		fingerprint, ok = desc.parsed.MediaDescriptions[0].Attribute("fingerprint")
@@ -779,7 +777,14 @@ func (pc *RTCPeerConnection) SetRemoteDescription(desc RTCSessionDescription) er
 	fingerprint = parts[1]
 	fingerprintHash = parts[0]
 
+	// Create RtcReceivers
+	err = pc.createRtpReceivers()
+	if err != nil {
+		return fmt.Errorf("failed to create receivers: %v", err)
+	}
+
 	// Create the SCTP transport
+	// TODO: Don't start SCTP if there are no data channels
 	sctp := pc.api.NewRTCSctpTransport(pc.dtlsTransport)
 	pc.sctpTransport = sctp
 
@@ -794,7 +799,7 @@ func (pc *RTCPeerConnection) SetRemoteDescription(desc RTCSessionDescription) er
 	})
 
 	go func() {
-		// Star the networking in a new routine since it will block until
+		// Start the networking in a new routine since it will block until
 		// the connection is actually established.
 
 		// Start the ice transport
@@ -829,12 +834,13 @@ func (pc *RTCPeerConnection) SetRemoteDescription(desc RTCSessionDescription) er
 			return
 		}
 
-		if pc.onTrackHandler != nil {
-			pc.openSRTP()
-		} else {
-			pcLog.Warnf("OnTrack unset, unable to handle incoming media streams")
+		// Start srtp
+		if len(pc.rtpTransceivers) > 0 {
+			err := pc.transceive()
+			if err != nil {
+				pcLog.Warnf("failed to transceive: %v", err)
+			}
 		}
-		go pc.drainSRTP()
 
 		// Start sctp
 		err = pc.sctpTransport.Start(RTCSctpCapabilities{
@@ -852,6 +858,24 @@ func (pc *RTCPeerConnection) SetRemoteDescription(desc RTCSessionDescription) er
 
 	return nil
 }
+func (pc *RTCPeerConnection) transceive() error {
+	// Start SRTP
+	err := pc.dtlsTransport.startSRTP()
+	if err != nil {
+		return fmt.Errorf("failed to start SRTP: %v", err)
+	}
+
+	// Open receivers
+	err = pc.openReceivers()
+	if err != nil {
+		return fmt.Errorf("failed to start receivers: %v", err)
+	}
+
+	// Drain any incoming SRTP packets not configured
+	go pc.dtlsTransport.drainSRTP()
+
+	return nil
+}
 
 // openDataChannels opens the existing data channels
 func (pc *RTCPeerConnection) openDataChannels() {
@@ -864,138 +888,65 @@ func (pc *RTCPeerConnection) openDataChannels() {
 	}
 }
 
-// openSRTP opens knows inbound SRTP streams from the RemoteDescription
-func (pc *RTCPeerConnection) openSRTP() {
-	incomingSSRCes := map[uint32]RTCRtpCodecType{}
-
-	for _, media := range pc.RemoteDescription().parsed.MediaDescriptions {
-		for _, attr := range media.Attributes {
-			var codecType RTCRtpCodecType
-			if media.MediaName.Media == "audio" {
-				codecType = RTCRtpCodecTypeAudio
-			} else if media.MediaName.Media == "video" {
-				codecType = RTCRtpCodecTypeVideo
-			} else {
-				continue
-			}
-
-			if attr.Key == sdp.AttrKeySsrc {
-				ssrc, err := strconv.ParseUint(strings.Split(attr.Value, " ")[0], 10, 32)
-				if err != nil {
-					pcLog.Warnf("Failed to parse SSRC: %v", err)
-					continue
-				}
-
-				incomingSSRCes[uint32(ssrc)] = codecType
-			}
+// createRtpReceivers creates RTCRtpReceiver based on the RemoteDescription
+func (pc *RTCPeerConnection) createRtpReceivers() error {
+	for _, mediaSection := range pc.RemoteDescription().parsed.MediaDescriptions {
+		var codecType RTCRtpCodecType
+		switch mediaSection.MediaName.Media {
+		case "audio":
+			codecType = RTCRtpCodecTypeAudio
+		case "video":
+			codecType = RTCRtpCodecTypeVideo
+		default:
+			// Skip data channels
+			continue
 		}
+
+		remoteCapabilities, err := sdpParseRtpParameters(mediaSection)
+		if err != nil {
+			return fmt.Errorf("failed to parse remote capabilities: %v", err)
+		}
+
+		recvDecodingParameters, err := sdpParseRtpDecodingParameters(mediaSection)
+		if err != nil {
+			return fmt.Errorf("failed to parse decoding parameters: %v", err)
+		}
+
+		receiver := pc.api.NewRTCRtpReceiver(codecType, pc.dtlsTransport)
+		// TODO: Check if trancevier exists?
+		transceiver := pc.newRTCRtpTransceiver(
+			receiver,
+			nil,
+			RTCRtpTransceiverDirectionRecvonly,
+		)
+
+		transceiver.recvDecodingParameters = recvDecodingParameters
+		transceiver.remoteCapabilities = remoteCapabilities
 	}
 
-	for i := range incomingSSRCes {
-		go func(ssrc uint32, codecType RTCRtpCodecType) {
-			receiver := NewRTCRtpReceiver(codecType, pc.dtlsTransport)
-			<-receiver.Receive(RTCRtpReceiveParameters{
-				encodings: RTCRtpDecodingParameters{
-					RTCRtpCodingParameters{SSRC: ssrc},
-				}})
-
-			sdpCodec, err := pc.CurrentLocalDescription.parsed.GetCodecForPayloadType(receiver.Track.PayloadType)
-			if err != nil {
-				pcLog.Warnf("no codec could be found in RemoteDescription for payloadType %d", receiver.Track.PayloadType)
-				return
-			}
-
-			codec, err := pc.api.mediaEngine.getCodecSDP(sdpCodec)
-			if err != nil {
-				pcLog.Warnf("codec %s in not registered", sdpCodec)
-				return
-			}
-
-			receiver.Track.Kind = codec.Type
-			receiver.Track.Codec = codec
-			pc.newRTCRtpTransceiver(
-				receiver,
-				nil,
-				RTCRtpTransceiverDirectionRecvonly,
-			)
-
-			pc.onTrack(receiver.Track)
-		}(i, incomingSSRCes[i])
-	}
-
+	return nil
 }
 
-// drainSRTP pulls and discards RTP/RTCP packets that don't match any SRTP
-// These could be sent to the user, but right now we don't provide an API
-// to distribute orphaned RTCP messages. This is needed to make sure we don't block
-// and provides useful debugging messages
-func (pc *RTCPeerConnection) drainSRTP() {
-	go func() {
-		for {
-			srtpSession, err := pc.dtlsTransport.getSRTPSession()
+// openReceivers opens the RTCRtpReceiver registered with the PeerConnection
+func (pc *RTCPeerConnection) openReceivers() error {
+	for _, transceiver := range pc.rtpTransceivers {
+		receiver := transceiver.Receiver
+		if receiver != nil {
+			params := RTCRtpReceiveParameters{
+				RTCRtpParameters: transceiver.remoteCapabilities,
+				Encodings:        transceiver.recvDecodingParameters,
+			}
+
+			err := receiver.Receive(params)
 			if err != nil {
-				pcLog.Warnf("drainSRTP failed to open SrtpSession: %v", err)
-				return
+				return fmt.Errorf("failed to receive: %v", err)
 			}
 
-			r, ssrc, err := srtpSession.AcceptStream()
-			if err != nil {
-				pcLog.Warnf("Failed to accept RTP %v \n", err)
-				return
-			}
-
-			go func() {
-				rtpBuf := make([]byte, receiveMTU)
-				rtpPacket := &rtp.Packet{}
-
-				for {
-					i, err := r.Read(rtpBuf)
-					if err != nil {
-						pcLog.Warnf("Failed to read, drainSRTP done for: %v %d \n", err, ssrc)
-						return
-					}
-
-					if err := rtpPacket.Unmarshal(rtpBuf[:i]); err != nil {
-						pcLog.Warnf("Failed to unmarshal RTP packet, discarding: %v \n", err)
-						continue
-					}
-					pcLog.Debugf("got RTP: %+v", rtpPacket)
-				}
-			}()
+			pc.onTrack(receiver.Track)
 		}
-	}()
-
-	for {
-		srtcpSession, err := pc.dtlsTransport.getSRTCPSession()
-		if err != nil {
-			pcLog.Warnf("drainSRTP failed to open SrtcpSession: %v", err)
-			return
-		}
-
-		r, ssrc, err := srtcpSession.AcceptStream()
-		if err != nil {
-			pcLog.Warnf("Failed to accept RTCP %v \n", err)
-			return
-		}
-
-		go func() {
-			rtcpBuf := make([]byte, receiveMTU)
-			for {
-				i, err := r.Read(rtcpBuf)
-				if err != nil {
-					pcLog.Warnf("Failed to read, drainSRTCP done for: %v %d \n", err, ssrc)
-					return
-				}
-
-				rtcpPacket, _, err := rtcp.Unmarshal(rtcpBuf[:i])
-				if err != nil {
-					pcLog.Warnf("Failed to unmarshal RTCP packet, discarding: %v \n", err)
-					continue
-				}
-				pcLog.Debugf("got RTCP: %+v", rtcpPacket)
-			}
-		}()
 	}
+
+	return nil
 }
 
 // RemoteDescription returns PendingRemoteDescription if it is not null and
@@ -1038,28 +989,28 @@ func (pc *RTCPeerConnection) AddIceCandidate(s string) error {
 // ------------------------------------------------------------------------
 
 // GetSenders returns the RTCRtpSender that are currently attached to this RTCPeerConnection
-func (pc *RTCPeerConnection) GetSenders() []RTCRtpSender {
-	result := make([]RTCRtpSender, len(pc.rtpTransceivers))
+func (pc *RTCPeerConnection) GetSenders() []*RTCRtpSender {
+	result := make([]*RTCRtpSender, len(pc.rtpTransceivers))
 	for i, tranceiver := range pc.rtpTransceivers {
-		result[i] = *tranceiver.Sender
+		result[i] = tranceiver.Sender
 	}
 	return result
 }
 
 // GetReceivers returns the RTCRtpReceivers that are currently attached to this RTCPeerConnection
-func (pc *RTCPeerConnection) GetReceivers() []RTCRtpReceiver {
-	result := make([]RTCRtpReceiver, len(pc.rtpTransceivers))
+func (pc *RTCPeerConnection) GetReceivers() []*RTCRtpReceiver {
+	result := make([]*RTCRtpReceiver, len(pc.rtpTransceivers))
 	for i, tranceiver := range pc.rtpTransceivers {
-		result[i] = *tranceiver.Receiver
+		result[i] = tranceiver.Receiver
 	}
 	return result
 }
 
 // GetTransceivers returns the RTCRtpTransceiver that are currently attached to this RTCPeerConnection
-func (pc *RTCPeerConnection) GetTransceivers() []RTCRtpTransceiver {
-	result := make([]RTCRtpTransceiver, len(pc.rtpTransceivers))
+func (pc *RTCPeerConnection) GetTransceivers() []*RTCRtpTransceiver {
+	result := make([]*RTCRtpTransceiver, len(pc.rtpTransceivers))
 	for i, tranceiver := range pc.rtpTransceivers {
-		result[i] = *tranceiver
+		result[i] = tranceiver
 	}
 	return result
 }
@@ -1093,7 +1044,7 @@ func (pc *RTCPeerConnection) AddTrack(track *RTCTrack) (*RTCRtpSender, error) {
 			return nil, err
 		}
 	} else {
-		sender := NewRTCRtpSender(track, pc.dtlsTransport)
+		sender := pc.api.NewRTCRtpSender(track, pc.dtlsTransport)
 		transceiver = pc.newRTCRtpTransceiver(
 			nil,
 			sender,
@@ -1290,9 +1241,14 @@ func (pc *RTCPeerConnection) SendRTCP(pkt rtcp.Packet) error {
 		return err
 	}
 
-	srtcpSession, err := pc.dtlsTransport.getSRTCPSession()
-	if err != nil {
-		return fmt.Errorf("SendRTCP failed to open SRTCPSession: %v", err)
+	dtls := pc.dtlsTransport
+	if dtls == nil {
+		return errors.New("the DTLS transport is not started")
+	}
+
+	srtcpSession := dtls.srtcpSession
+	if srtcpSession == nil {
+		return errors.New("the SRTCP session is not started")
 	}
 
 	writeStream, err := srtcpSession.OpenWriteStream()
@@ -1335,18 +1291,6 @@ func (pc *RTCPeerConnection) Close() error {
 	//    Conn if one of the endpoints is closed down. To
 	//    continue the chain the Mux has to be closed.
 
-	if pc.dtlsTransport.srtpSession != nil {
-		if err := pc.dtlsTransport.srtpSession.Close(); err != nil {
-			closeErrs = append(closeErrs, err)
-		}
-	}
-
-	if pc.dtlsTransport.srtcpSession != nil {
-		if err := pc.dtlsTransport.srtcpSession.Close(); err != nil {
-			closeErrs = append(closeErrs, err)
-		}
-	}
-
 	for _, t := range pc.rtpTransceivers {
 		if err := t.Stop(); err != nil {
 			closeErrs = append(closeErrs, err)
@@ -1359,7 +1303,9 @@ func (pc *RTCPeerConnection) Close() error {
 		}
 	}
 
-	// TODO: Close DTLS?
+	if pc.dtlsTransport != nil {
+		pc.dtlsTransport.Stop()
+	}
 
 	if pc.iceTransport != nil {
 		if err := pc.iceTransport.Stop(); err != nil {
@@ -1429,7 +1375,7 @@ func (pc *RTCPeerConnection) addRTPMediaSection(d *sdp.SessionDescription, codec
 		WithPropertyAttribute(sdp.AttrKeyRtcpRsize) // TODO: Support Reduced-Size RTCP?
 
 	for _, codec := range pc.api.mediaEngine.getCodecsByKind(codecType) {
-		media.WithCodec(codec.PayloadType, codec.Name, codec.ClockRate, codec.Channels, codec.SdpFmtpLine)
+		media.WithCodec(codec.PayloadType, codec.Name, codec.ClockRate, uint16(codec.Channels), codec.SdpFmtpLine)
 	}
 
 	weSend := false
