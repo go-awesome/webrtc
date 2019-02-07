@@ -15,11 +15,13 @@ require (
 )
 
 require (
+	github.com/bifurcation/mint v0.0.0-20190129141059-83ba9bc2ead9 // indirect
 	github.com/cheekybits/genny v1.0.0 // indirect
-	github.com/cloudflare/sidh v0.0.0-20181111220428-fc8e6378752b // indirect
 	github.com/golang/mock v1.2.0 // indirect
-	github.com/lucas-clemente/quic-go v0.7.1-0.20190107031857-6fbe8d563eca
-	github.com/marten-seemann/qtls v0.0.0-20190110111248-7a090b30c3ab // indirect
+	github.com/hashicorp/golang-lru v0.5.0 // indirect
+	github.com/lucas-clemente/aes12 v0.0.0-20171027163421-cd47fb39b79f // indirect
+	github.com/lucas-clemente/quic-go v0.10.1
+	github.com/lucas-clemente/quic-go-certificates v0.0.0-20160823095156-d2f86524cced // indirect
 	github.com/onsi/ginkgo v1.7.0 // indirect
 	github.com/onsi/gomega v1.4.3 // indirect
 )
